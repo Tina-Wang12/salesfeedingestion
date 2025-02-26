@@ -1,0 +1,156 @@
+import pysftp
+import sys
+from datetime import datetime,timedelta
+import configparser
+import os
+import shutil
+import json
+from airflow.exceptions import AirflowFailException
+from airflow import AirflowException
+import requests
+import datetime
+
+
+cnopts = pysftp.CnOpts()
+cnopts.hostkeys = None
+input_dir = r'/var/working/bell/input/'
+creds_file =r'/home/spark/main_config/master_config_file.ini'
+creds = configparser.ConfigParser()
+creds.sections()
+creds.read(creds_file)
+j = json.load(open('/home/spark/Test_GRAPH_API/ms_graphapi_token_share_data_v3.json'))
+access_token = j['access_token']
+END_POINT = 'https://graph.microsoft.com/v1.0'
+# credentials
+sftp_host = creds['bi-sftp']['hostname']
+sftp_user = creds['bi-sftp']['username']
+sftp_pass = creds['bi-sftp']['password']
+foldername='OSL Weekly files'
+finance= '/OSLDirect/financebelldata/Invoice'
+
+headers = {
+	"Authorization" : 'Bearer ' + access_token,
+    "Content-Type" : 'application/json'
+}
+
+def create_sharepoint_folder(sharepoint_folder):
+  #loop each shared item in sharepoint, locate the name of the folder
+  try:
+        files_response = requests.get(END_POINT + '/me/drive/sharedWithMe?allowexternal=true',headers=headers)
+        
+        if files_response.status_code in range(200,209):
+            shared_files = files_response.json().get('value', [])
+            if shared_files:
+                for file in shared_files:
+
+                    folder_id = file.get('remoteItem', {}).get('id', None)
+                    folder_name = file.get('name')
+
+                    if file.get('folder',None) is not None and folder_name == sharepoint_folder:
+                        drive_id = file.get('remoteItem', {}).get('parentReference', {}).get('driveId', None)
+                        site_id = file.get('remoteItem', {}).get('parentReference', {}).get('siteId', None)
+                        new_folder_name = datetime.datetime.now().strftime('%Y %m %d') + ' Weekly Files'
+
+                        # Check if the folder with the same name already exists
+                        existing_folder_url = f'https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{folder_id}/children?$filter=name eq \'{new_folder_name}\''
+                        existing_folder_response = requests.get(existing_folder_url, headers=headers)
+                        existing_folder_response.raise_for_status()
+                        existing_folders = existing_folder_response.json()['value']
+                        if existing_folders:
+                            existing_folders = existing_folders[0]['id']
+                            print(f"Folder '{new_folder_name}' already exists. Skipping creation.")
+                            return site_id,drive_id,existing_folders
+                        # If folder not exist, create the folder with current date naming
+                        else: 
+                          create_folder_url = f'https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{folder_id}/children'
+                          folder_data = {
+                              'name': new_folder_name,
+                              'folder': {},
+                              '@microsoft.graph.conflictBehavior': 'fail'
+                          }
+
+                          create_folder_response = requests.post(create_folder_url, headers=headers, json=folder_data)
+                          create_folder_response.raise_for_status()
+                          created_folder_id = create_folder_response.json()['id']
+                          print('folder {0} has been created'.format(existing_folder_url))
+                          #return all info 
+                          return site_id,drive_id,created_folder_id
+
+            else:
+                print('Failed to list shared files. Status code: {0}'.format(files_response.status_code))
+
+  except Exception as e:
+      print('An error occurred: {0}'.format(str(e)))
+
+
+
+def fetch_file():
+  try:
+    print('Intializing file download from ftp exavault..')
+    with pysftp.Connection(sftp_host, username=sftp_user, password=sftp_pass, cnopts=cnopts) as sftp:
+      sftp.cwd('/Bell/finance_external')
+      filelisting = sftp.listdir()
+      if filelisting:
+        # If Bell comp drop files
+        current_date = datetime.datetime.now().strftime('%Y %m %d')
+        target_date_directory = os.path.join(finance, current_date)
+        # Create a folder in finance FTP
+        if not sftp.exists(target_date_directory):
+          sftp.makedirs(target_date_directory)
+        # Create a folder in Sharepoint OSL Weekly File folder  
+        site_id,drive_id,folder_id=create_sharepoint_folder(foldername)
+
+        # Loop through each file, upload to Sharepoint, move invoice files to Finance and move salesfeed to server
+        for file in filelisting:
+          file_path = '/Bell/finance_external/{0}'.format(file)
+
+          #this step push all files to OSL Weekly Folder for Comp team uses
+          with sftp.open(file_path , 'rb') as file_content:
+            upload_url = f'https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{folder_id}:/{file}:/content'
+            response = requests.put(upload_url, headers=headers, data=file_content)
+            response.raise_for_status()
+            print('{0} has been uploaded to OSL Weekly Data Folder'.format(file))
+
+          # If the file is invocie pdf or master file, move to finance FTP
+            if file.lower().endswith('.pdf') or 'master' in file.lower():
+              sftp_target_path = os.path.join(target_date_directory, file)
+              sftp.rename(file_path, sftp_target_path)
+              print('{0} has been transfered to Finance FTP folder'.format(file))
+            else:
+              #move other files into working dir
+              sftp.get(file_path,(input_dir + file))
+              output_file = os.path.join(input_dir, file)
+              os.system('chmod 666 {0}'.format(output_file))
+              print('{0} has been download to bell input working dir'.format(file))
+        
+      else:
+         print('Bell comp has not drop new files')
+
+  except BaseException as e:
+    print(e)
+  
+
+def delete_sftp():
+  try:
+    with pysftp.Connection(sftp_host, username=sftp_user, password=sftp_pass, cnopts=cnopts) as sftp:
+
+      sftp.cwd('/Bell/finance_external')
+      filelisting = sftp.listdir()
+
+      # Delete each file in the directory
+      for file in filelisting:
+          sftp.remove(file)
+          print(f"Deleted file: {file}")
+  except BaseException as e:
+    print('Could not delete process with error {0}'.format(e))
+
+def main():
+  #Create a folder with current date in Sharepoint
+  try:
+    fetch_file()
+    delete_sftp()
+  except Exception as e:
+     print('Process failed with msg {0}'.format(e))
+
+if __name__ == '__main__':
+  main()
