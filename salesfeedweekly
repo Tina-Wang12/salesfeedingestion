@@ -1,0 +1,250 @@
+import os
+import pysftp
+import glob
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+import configparser
+import logging
+import sys
+import psycopg2
+from pyspark.sql.functions import current_timestamp,to_date, col,lit, when
+
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType
+from pyspark.sql.types import TimestampType
+from pyspark.sql.types import DateType
+import shutil
+from openpyxl import load_workbook
+import openpyxl
+
+cnopts = pysftp.CnOpts()
+cnopts.hostkeys = None
+config_path = r'/home/spark/belladp/config'
+config_file = os.path.join(config_path,'bell_salesfeed.ini')
+creds_file = r'/home/spark/main_config/master_config_file.ini' 
+
+
+file_path= r'/var/working/bell/input'
+log_path = r'/home/spark/belladp/logs'
+
+#config file
+config = configparser.ConfigParser()
+config.sections()
+config.read(config_file)
+brs=config['postgres']['brs']
+dev_driver=config['postgres']['driver']
+
+
+#cred files
+creds = configparser.ConfigParser()
+creds.sections()
+creds.read(creds_file)
+dev_username = creds['postgres']['username']
+dev_password = creds['postgres']['password']
+sftp_host = creds['bi-sftp']['hostname']
+sftp_username = creds['bi-sftp']['username']
+sftp_password = creds['bi-sftp']['password']
+
+
+job ='salesfeed'
+
+
+spark = SparkSession.builder\
+    .master("local").appName("Bell {0}".format(job)).getOrCreate()
+spark.sparkContext.setLogLevel('FATAL')
+log4jLogger = spark._jvm.org.apache.log4j
+LOGGER = log4jLogger.LogManager.getLogger(__name__)
+LOGGER.debug("initializing Bell {0} spark job..".format(job))
+
+def job_logger(msg,lvl='info'):
+    logging.basicConfig(format='%(asctime)s - %(message)s',filemode='w')
+    # create logger object
+    logger =  logging.getLogger("py4j")
+    # Setting threshold of logger
+    logger.setLevel(logging.INFO)
+    if lvl == 'info':
+        logger.info(msg)
+    elif lvl == 'debug':
+        logger.info(msg)
+    elif lvl == 'error':
+        logger.info(msg)
+    elif lvl == 'warning':
+        logger.info(msg)
+    else:
+        logger.info(msg)
+
+def import_tables(url,table,driver,username,password):
+		df = spark.read.format("jdbc")\
+				.option("url",url)\
+				.option("driver",driver)\
+				.option("user",username)\
+				.option("password",password)\
+                .option("encoding", "UTF-8")\
+				.option("dbtable",table)\
+				.load()
+		return (df,table)	
+
+
+def check_file (filelist):
+    #check if files are already pushed to Postgres
+    try:
+        unload_files=[]
+        with open(os.path.join(log_path,'{0}_audit.log'.format(job)),'r') as audit:
+            loaded_files=audit.readlines()
+            loaded_files=[file.strip() for file in loaded_files]
+            for file in filelist:
+                if os.path.basename(file).strip() in loaded_files:
+                    pass
+                else:    
+                    unload_files.append(file)
+            return unload_files
+    except Exception as e:
+         job_logger('Could not read audit file with reason:{}'.format(e))
+
+def read_file(filename):
+    #read csv file
+    job_logger('Now loading file {0}'.format(os.path.basename(filename)),'Info')
+    try:
+      df = spark.read.format("csv")\
+			.option("header",True)\
+			.load(filename)
+      return (df)
+    except:
+      job_logger('File {} not readable...'.format(os.path.basename(filename)),'Info')
+      return (None)
+
+def change_header(df):
+    #this function is to update the column names for the incoming file
+    new_column_names=['bus_unit_agent', 'team_bell', 'sales_rep_id', 'rep_name', 
+                      'eff_date', 'expy_date', 'rep_status_bell', 'agt_prov', 'payment_we', 'orderno', 
+                      'lob', 'sale_date', 'activation_date', 'transaction_type', 'bus_unit', 
+                      'comp_volume', 'comp_amount', 'customer_last_name', 'customer_first_name', 
+                      'service_tn', 'account_number', 'subscription_id', 'unit_num', 'civic_num', 
+                      'street_name', 'street_type', 'municipality', 'postal_cd', 'prov_cd', 'data_source', 'report_date','payment_description']
+
+    old_column_names=['AGENT_BUS_UNIT','ACTIVATION_REPORT_FILTER','SALES_REP_ID','REP_NAME','EFF_DATE',
+                      'EXPY_DATE','STATUS','AGENT_PROV','PAYMENT_WE','ORDERNO','PAYMENT_LOB','ORDER_DT','ACTIVITY_DT',
+                      'TRANSACTION_TYPE','COMP_BUS_UNIT','COMP_VOLUME','COMP_AMOUNT','CUSTOMER_LAST_NAME','CUSTOMER_FIRST_NAME',
+                      'SERVICE_TN','ACCOUNT_NUMBER','SUBSCRIPTION_ID','UNIT_NUM','CIVIC_NUM','STREET_NAME','STREET_TYPE',
+                      'MUNICIPALITY','POSTAL_CD','PROV_CD','DATA SOURCE','REPORT_DATE','PAYMENT_DESCRIPTION']
+    
+    
+    for old_col, new_col in zip(old_column_names,new_column_names):
+        df=df.withColumnRenamed(old_col,new_col)
+
+    
+    return df
+
+def etl(df,filename):
+    nr=spark.sql("""SELECT nr.pein, nr.team as team_nr
+                    FROM nominal_roll_agent nr 
+                    JOIN
+                    (select tm.pein, MAX(tm.version_we) AS maxv
+                    from 
+                        (
+                        SELECT nra.*
+                        FROM nominal_roll_agent nra
+                        JOIN 
+                            (select pein, MAX(version_we) AS maxver
+                            from nominal_roll_agent
+                            where terminationdate  > (select max(activation_date) -1000 from bell_osl_sales_feed bosf)
+                            GROUP BY pein) maxversion on nra.pein = maxversion.pein and nra.version_we = maxversion.maxver
+
+                        UNION ALL
+
+                        select *
+                            from nominal_roll_agent
+                            where terminationdate IS NULL and version_we = (select max(version_we) from nominal_roll_agent nra)
+                        ) tm
+                    GROUP BY tm.pein ) maxv
+                    ON nr.pein=maxv.pein AND nr.version_we=maxv.maxv""" )
+
+    columns_to_drop = ['payment_we']
+    df = df.drop(*columns_to_drop)
+    df = df.withColumn("quantity", lit(0))\
+            .withColumn("fp_offer", lit(None).cast("String"))\
+            .withColumn("bp_offer", lit(None).cast("String"))\
+            .withColumn("rack_rate", lit(None).cast("String"))\
+            .withColumn("uploadeddate", current_timestamp())\
+            .withColumn("file_name", lit(filename))
+    #map team info to table
+    df=df.join(nr,df.sales_rep_id==nr.pein, how='left').select(df["*"],nr['team_nr'])
+    #convert column types
+    df = df.withColumn("report_date", to_date(col("report_date"), "ddMMMyyyy"))\
+            .withColumn("activation_date", to_date(col("activation_date"), "ddMMMyyyy"))\
+            .withColumn("sale_date", to_date(col("sale_date"), "ddMMMyyyy"))\
+            .withColumn("eff_date", to_date(col("eff_date"), "ddMMMyyyy"))\
+            .withColumn("expy_date", to_date(col("expy_date"), "ddMMMyyyy"))\
+            .withColumn("quantity", col("quantity").cast("int"))\
+            .withColumn("comp_volume", col("comp_volume").cast("int"))\
+            .withColumn("comp_amount", col("comp_amount").cast("int"))
+    # Modify the DataFrame based on the condition
+    df = df.withColumn(
+                    "transaction_type",
+                    when(col("data_source") == "ATL BSH REFERRAL", "ATL BSH REFERRAL").otherwise(col("transaction_type"))
+                )
+
+    return df
+
+
+#ingest file
+def ingest_with_spark(df,filename):
+	
+	try:
+		if df:
+			
+			df.write.format("jdbc")\
+				.mode("append")\
+				.option('url',brs)\
+				.option("dbtable", 'bell_osl_sales_feed')\
+				.option("user", dev_username)\
+				.option("password", dev_password)\
+				.option("driver", dev_driver)\
+				.option("truncate",False)\
+				.save()
+			job_logger('successfully ingested {}'.format(filename),'Info')
+			with open (os.path.join(log_path, '{}_audit.log'.format(job)),'a') as audit:
+				audit.write(filename +'\n')	
+
+		else:
+			job_logger("Dataframe is empty",'Info')
+			with open(os.path.join(log_path,'{}_audit.log'.format(job)),'a') as audit:
+				audit.write(filename   + ' file is empty' +'\n')
+			
+	except BaseException as e:
+		job_logger('Could not connect to Database...\n{}'.format(e),'Info')
+
+def main():
+  job_logger("Job is Bell Salesfeed", 'info')
+
+  feeds = {           
+            "brs": {'tables':['nominal_roll_agent','bell_osl_sales_feed'],'url':brs,'driver':dev_driver,'username':dev_username,'password':dev_password},
+          }
+  # loop through all needed tables 
+  for key in [key for key in feeds.keys() if 'tables' in feeds[key].keys()]:
+        for table in feeds[key]['tables']:
+             dfeed=import_tables(feeds[key]['url'],table,feeds[key]['driver'],feeds[key]['username'],feeds[key]['password'])
+             dfeed[0].createOrReplaceTempView(dfeed[1])
+             #dfeed[0].show()
+             job_logger(table +' has been loaded : {}'.format(dfeed[0].count()),'info')
+
+
+  filelist=check_file(glob.glob(os.path.join(file_path,'*OSL Weekly Report_WE*.*')))
+  if filelist:
+    job_logger('Files to ingest: {0}'.format(', '.join([os.path.basename(file) for file in filelist])), 'info')
+  else:
+    job_logger('No files to ingest', 'info')
+
+  for file in filelist:
+
+    read_df=change_header(read_file(file))
+    etl_df=etl(read_df,os.path.basename(file))
+    ingest_with_spark(etl_df,os.path.basename(file))
+
+
+if __name__ == '__main__':
+  main()
+
