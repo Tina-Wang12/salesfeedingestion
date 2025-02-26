@@ -1,0 +1,224 @@
+import os
+import pysftp
+import glob
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+import configparser
+import logging
+import sys
+import psycopg2
+from pyspark.sql.functions import current_timestamp,to_date, col,lit, when,concat, lower, regexp_replace,coalesce
+
+from pyspark.sql.types import StringType
+from pyspark.sql.types import IntegerType
+from pyspark.sql.types import TimestampType
+from pyspark.sql.types import DateType
+import shutil
+from openpyxl import load_workbook
+import openpyxl
+
+cnopts = pysftp.CnOpts()
+cnopts.hostkeys = None
+config_path = r'/home/spark/belladp/config'
+config_file = os.path.join(config_path,'bell_salesfeed.ini')
+creds_file = r'/home/spark/main_config/master_config_file.ini' 
+
+
+file_path= r'/var/working/bell/input'
+log_path = r'/home/spark/belladp/logs'
+
+#config file
+config = configparser.ConfigParser()
+config.sections()
+config.read(config_file)
+brs=config['postgres']['brs']
+dev_driver=config['postgres']['driver']
+
+
+#cred files
+creds = configparser.ConfigParser()
+creds.sections()
+creds.read(creds_file)
+dev_username = creds['postgres']['username']
+dev_password = creds['postgres']['password']
+
+
+
+job ='chargeback'
+
+
+spark = SparkSession.builder\
+    .master("local").appName("Bell {0}".format(job)).getOrCreate()
+spark.sparkContext.setLogLevel('FATAL')
+log4jLogger = spark._jvm.org.apache.log4j
+LOGGER = log4jLogger.LogManager.getLogger(__name__)
+LOGGER.debug("initializing Bell {0} spark job..".format(job))
+
+def job_logger(msg,lvl='info'):
+    logging.basicConfig(format='%(asctime)s - %(message)s',filemode='w')
+    # create logger object
+    logger =  logging.getLogger("py4j")
+    # Setting threshold of logger
+    logger.setLevel(logging.INFO)
+    if lvl == 'info':
+        logger.info(msg)
+    elif lvl == 'debug':
+        logger.info(msg)
+    elif lvl == 'error':
+        logger.info(msg)
+    elif lvl == 'warning':
+        logger.info(msg)
+    else:
+        logger.info(msg)
+
+
+def import_tables(url,table,driver,username,password):
+		df = spark.read.format("jdbc")\
+				.option("url",url)\
+				.option("driver",driver)\
+				.option("user",username)\
+				.option("password",password)\
+                .option("encoding", "UTF-8")\
+				.option("dbtable",table)\
+				.load()
+		return (df,table)	
+
+def check_file (filelist):
+    #check if files are already pushed to Postgres
+    try:
+        unload_files=[]
+        with open(os.path.join(log_path,'{0}_audit.log'.format(job)),'r') as audit:
+            loaded_files=audit.readlines()
+            loaded_files=[file.strip() for file in loaded_files]
+            for file in filelist:
+                if os.path.basename(file).strip() in loaded_files:
+                    pass
+                else:    
+                    unload_files.append(file)
+            return unload_files
+    except Exception as e:
+         job_logger('Could not read audit file with reason:{}'.format(e))
+
+def read_file(filename):
+    #read csv file
+    job_logger('Now loading file {0}'.format(os.path.basename(filename)),'Info')
+    try:
+        sparkdf = spark.read.format('csv').option('header',True).option('encoding','utf-8').load(filename)
+        lowercase_cols = [col.strip().lower() for col in sparkdf.columns]
+        sparkdf = sparkdf.toDF(*lowercase_cols)
+        sparkdf=sparkdf.withColumnRenamed("agent_bus_unit", "bus_unit_agent")\
+                        .withColumnRenamed("activation_report_filter", "team_bell")\
+                        .withColumnRenamed("status", "rep_status_bell")\
+                        .withColumnRenamed("agent_prov", "agt_prov")\
+                        .withColumnRenamed("payment_lob", "lob")\
+                        .withColumnRenamed("comp_bus_unit", "bus_unit")
+
+        return sparkdf
+    except:
+      job_logger('File {} not readable...'.format(os.path.basename(filename)),'Info')
+      return (None)
+
+
+def etl(df,filename):
+    cd=spark.sql("""SELECT row_id, lower(regexp_replace(concat(coalesce(sales_rep_id,''), coalesce(orderno,''), coalesce(lob,''), coalesce(activation_date,''),coalesce(service_tn,'')) ,' ','')) as col from bell_osl_commission_detail where lower(regexp_replace(concat(coalesce(sales_rep_id,''), coalesce(orderno,''), coalesce(lob,''), coalesce(activation_date,''),coalesce(service_tn,'')) ,' ','')) is not null and transaction_type in ('Adjustment','Activation','Migration','Move')""" )
+
+    #convert column types
+
+
+    df = df.withColumn("report_date", to_date(col("report_date"), "ddMMMyyyy"))\
+            .withColumn("activation_date", to_date(col("activation_date"), "ddMMMyyyy"))\
+            .withColumn("sale_date", to_date(col("sale_date"), "ddMMMyyyy"))\
+            .withColumn("transaction_date", to_date(col("transaction_date"), "ddMMMyyyy"))\
+            .withColumn("payment_we", to_date(col("payment_we"), "ddMMMyyyy"))\
+            .withColumn("eff_date", to_date(col("eff_date"), "ddMMMyyyy"))\
+            .withColumn("expy_date", to_date(col("expy_date"), "ddMMMyyyy"))\
+            .withColumn("comp_volume", col("comp_volume").cast("int"))\
+            .withColumn("comp_amount", col("comp_amount").cast("int"))\
+            .withColumn("uploadeddate", current_timestamp())\
+            .withColumn("file_name", lit(filename))
+
+    #map row_id from com detail to table
+    df = df.withColumn("transformed_col",  lower(
+        regexp_replace(
+            concat(
+                coalesce(col("sales_rep_id"), lit('')),  
+                coalesce(col("orderno"), lit('')),      
+                coalesce(col("lob"), lit('')),          
+                coalesce(col("activation_date"), lit('')), 
+                coalesce(col("service_tn"), lit(''))  
+            ),
+            ' ', ''  # Remove spaces if any
+        )
+    ))
+    df=df.join(cd, df.transformed_col==cd.col, how='left').select(df["*"],cd['row_id'].alias("cd_row_id"),cd['col'])
+    #df.show()
+
+    #output_file=os.path.join('/var/working/bell/output','{}'.format(filename))
+    #dfcsv=df.toPandas()
+    #dfcsv.to_csv(output_file,index=False)
+    #os.system('chmod 666 {0}'.format(output_file))
+
+    columns_to_drop = ['transformed_col','col']
+    df = df.drop(*columns_to_drop)
+    return df
+
+
+#ingest file
+def ingest_with_spark(df,filename):
+	
+	try:
+		if df:
+			#df.show()
+			df.write.format("jdbc")\
+				.mode("append")\
+				.option('url',brs)\
+				.option("dbtable", 'bell_chargeback')\
+				.option("user", dev_username)\
+				.option("password", dev_password)\
+				.option("driver", dev_driver)\
+				.option("truncate",False)\
+				.save()
+			job_logger('successfully ingested {}'.format(filename),'Info')
+			with open (os.path.join(log_path, '{}_audit.log'.format(job)),'a') as audit:
+				audit.write(filename +'\n')	
+
+		else:
+			job_logger("Dataframe is empty",'Info')
+			with open(os.path.join(log_path,'{}_audit.log'.format(job)),'a') as audit:
+				audit.write(filename   + ' file is empty' +'\n')
+			
+	except BaseException as e:
+		job_logger('Could not connect to Database...\n{}'.format(e),'Info')
+
+def main():
+  job_logger("Job is Bell Chargeback", 'info')
+  feeds = {           
+            "brs": {'tables':['nominal_roll_agent','bell_osl_sales_feed','bell_osl_commission_detail'],'url':brs,'driver':dev_driver,'username':dev_username,'password':dev_password},
+          }
+  # loop through all needed tables 
+  for key in [key for key in feeds.keys() if 'tables' in feeds[key].keys()]:
+        for table in feeds[key]['tables']:
+             dfeed=import_tables(feeds[key]['url'],table,feeds[key]['driver'],feeds[key]['username'],feeds[key]['password'])
+             dfeed[0].createOrReplaceTempView(dfeed[1])
+             #dfeed[0].show()
+             job_logger(table +' has been loaded : {}'.format(dfeed[0].count()),'info')
+
+  filelist=check_file(glob.glob(os.path.join(file_path,'Chargeback_data_WE*.*')))
+  if filelist:
+    job_logger('Files to ingest: {0}'.format(', '.join([os.path.basename(file) for file in filelist])), 'info')
+  else:
+    job_logger('No files to ingest', 'info')
+
+  for file in filelist:
+
+    read_df=(read_file(file))
+    etl_df=etl(read_df,os.path.basename(file))
+    ingest_with_spark(etl_df,os.path.basename(file))
+
+
+if __name__ == '__main__':
+  main()
+
